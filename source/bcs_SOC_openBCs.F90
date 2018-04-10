@@ -5,12 +5,13 @@ program bcs_openBCs
 
   integer                        :: nk(3), nsites, nmesh, msite, getCN, BCs, IVext 
   integer                        :: Nthetax, Nthetay, thetax, thetay, IH0
+  integer                        :: NI
   real(kind=8)                   :: thop, lambda, U, mu, hz, temp, alpha, beta, tol
   real(kind=8)                   :: theta_twist(4), kpoint_x, kpoint_y, kpoint_z
   complex(kind=8),allocatable    :: Hzero(:,:)
   complex(kind=8),allocatable    :: phi(:,:,:)           
   real(kind=8),allocatable       :: Vext(:)     
-  logical                        :: openBCs, calc_CN
+  logical                        :: openBCs, calc_CN, non_inter
   character*75                   :: filename
   character*10                   :: Lxstr, Lystr, Ustr, mustr, hzstr
 
@@ -33,6 +34,7 @@ program bcs_openBCs
   read(10,*) temp      !temperature
   read(10,*) alpha     !newgap(j) = alpha*newgap(j) + beta*gap(j)
   read(10,*) beta
+  read(10,*) NI        !1 if non-interacting system, 0 otherwise
   read(10,*) IVext     !1 if an external field is present, 0 otherwise
   read(10,*) IH0       !1 if read hopping matrix from file, 0 otherwise
   close(10)
@@ -51,6 +53,12 @@ program bcs_openBCs
      openBCs = .false.      !PBC
   endif
   calc_CN = .false.
+
+  if(NI.gt.0) then
+     non_inter = .true.       !OBC
+  else 
+     non_inter = .false.      !PBC
+  endif
 
   nsites = product(nk)
 
@@ -104,11 +112,157 @@ program bcs_openBCs
  theta_twist(3) = 2*pi*theta_twist(3)
  theta_twist(4) = 2*pi*theta_twist(4)
 
- call scf_loop(nk,nsites,iH0,Hzero,thop,msite,nmesh,phi,theta_twist, lambda,                   &
-     &         U, mu, hz, temp, Vext, alpha, beta, tol, openBCs,calc_CN)
+
+ if(non_inter) then
+    ! if system is non-interacting don't run full SCF procedure
+    call non_interacting()
+ else
+    call scf_loop(nk,nsites,iH0,Hzero,thop,msite,nmesh,phi,theta_twist, lambda,                   &
+         &         U, mu, hz, temp, Vext, alpha, beta, tol, openBCs,calc_CN)
+ endif
  close(50)
 
 end program bcs_openBCs
+
+!------------------------------------------------------------------!
+
+! Solve non-interacting system
+subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu, hz, &
+     temp, Vext, openBCs) 
+
+  use mpiwrap
+  implicit none
+
+  integer, intent(in)            :: nk(3), nsites, iH0
+  logical, intent(in)            :: openBCs
+  real(kind=8), intent(in)       :: thop, lambda, mu, hz, temp, theta_twist(4)
+  real(kind=8), intent(in)       :: Vext(nsites)
+  complex(kind=8), intent(in)    :: Hzero(2*nsites,2*nsites)
+
+  real(kind=8)                   :: rwork(50000)
+  real(kind=8), allocatable      :: ener(:)
+  integer, parameter             :: lwork=50000
+  complex(kind=8)                :: work(lwork)
+
+  integer                        :: Hdim, Udim, i, j, k, ix, iy, Dimen,idim, jdim
+  real(kind=8)                   :: energy_sum, f, ptcl_sum, pol_sum
+  complex(kind=8), allocatable   :: H(:,:)
+  complex(kind=8), allocatable   :: Ubcs(:,:),Vbcs(:,:)
+  complex(kind=8)                :: dmat(2*nsites,2*nsites),dmath(2*nsites,2*nsites)
+  complex(kind=8)                :: pmat(2*nsites,2*nsites),pmatbar(2*nsites,2*nsites)
+  complex(kind=8)                :: zero_vec(nsites)
+  complex(kind=8)                :: Q(2*nsites,2*nsites), tmp(2*nsites,2*nsites)
+  complex(kind=8), parameter     :: xi=dcmplx(0d0,1d0)
+  real(kind=8), parameter        :: one=1.d0
+  real(kind=8), parameter        :: zero=0.d0
+  complex(kind=8)                :: sumup, sumdn, sumtot, en_gs
+  real(kind=8)                   :: hop(nsites,nsites), KE, MUE, MUEH
+  real(kind=8)                   :: rvec(3,2*nsites),rav(3),metric(3,3)
+
+  complex(kind=8)                :: sum1, sum2
+  integer                        :: norb
+
+  ptcl_sum    = 0.d0
+  pol_sum     = 0.d0
+  KE          = 0.d0
+  MUE         = 0.d0
+  MUEH        = 0.d0
+  Hdim        = 4*nsites
+  Udim        = 2*nsites
+  energy_sum  = 0.d0
+  Hdim        = 4*nsites
+  Udim        = 2*nsites
+
+  allocate(H(Hdim,Hdim))
+  allocate(ener(Hdim))
+  allocate(Ubcs(Udim,Udim))
+  allocate(Vbcs(Udim,Udim))
+
+  H(:,:)      = 0.d0
+  ener(:)     = 0.d0
+  zero_vec(:) = 0.d0
+
+  ! build H
+  if(iH0.eq.0)then
+     if(openBCs) then
+        call buildHopen(nsites, Hdim, H, nk, thop, lambda, zero_vec, mu, hz, Vext)
+     else
+        call buildH(nsites, Hdim, H, nk, thop, theta_twist, lambda, zero_vec, mu, hz, Vext)
+     end if
+  else
+     call buildHext(nsites, Hdim, H, nk, Hzero, zero_vec, mu, hz, Vext)
+  endif
+
+  ! check to make sure Hamiltonian is hermitian
+  call check_Hermite_c(H,Hdim)
+
+  ! diagonalize H
+  call zheev("V","L",Hdim,H,Hdim,ener,work,lwork,rwork,i)
+
+  open(2,file='eigenvalues_hfb_hamiltonian.out',status='unknown')
+  do i = 1, 4*nsites
+     write(2,*)i,ener(i)
+  enddo
+  close(2)
+
+  ! get matrices U and V
+  !
+  !    H    (  V*  U  )  =   (  V*  U )  (  -E    0  )
+  !         (  U*  V  )      (  U*  V )  (   0    E  )
+
+  Vbcs(1:2*nsites,1:2*nsites)=conjg(H(1:2*nsites         ,1:2*nsites))
+  Ubcs(1:2*nsites,1:2*nsites)=conjg(H(1+2*nsites:4*nsites,1:2*nsites))
+
+  ! get density matrix and pairing tensor
+  dmat(:,:) = 0.d0
+  pmat(:,:) = 0.d0
+  pmatbar(:,:) = 0.d0
+
+  ! dmat_{ij} =  (V* VT)_{i,j} = <c+_j c_i>
+  call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1:2*nsites,1:2*nsites), &
+       2*nsites,H(1:2*nsites,1:2*nsites),2*nsites,zero,dmat,2*nsites)
+
+  !  pmat_{ij}    = (V* UT)_{ij} = <c_jc_i> 
+  call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1:2*nsites,1:2*nsites), &
+       2*nsites,H(1+2*nsites:4*nsites,1:2*nsites),2*nsites,zero,pmat,2*nsites)
+
+  !  pmatbar_{ij} = (U* VT)_{ij} = <cdagger_i cdagger_j>
+  call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1+2*nsites:4*nsites,1:2*nsites), &
+       2*nsites,H(1:2*nsites,1:2*nsites),2*nsites,zero,pmatbar,2*nsites)
+
+  open(2,file='density_matrix.out',status='unknown')
+  do i = 1, 2*nsites
+    do j = 1, 2*nsites
+      write(2,*)i,j,dmat(i,j)
+    enddo
+  enddo
+  close(2)
+  open(2,file='pairing_matrix.out',status='unknown')
+  do i = 1, 2*nsites
+    do j = 1, 2*nsites
+      write(2,*)i,j,pmat(i,j)
+    enddo
+  enddo
+  write(2,*)
+  write(2,*)
+  do i = 1, 2*nsites
+    do j = 1, 2*nsites
+      write(2,*)i,j,pmatbar(i,j)
+    enddo
+  enddo
+  close(2)
+
+  sumup = 0.d0
+  sumdn = 0.d0
+  do i = 1, nsites
+     sumup = sumup + dmat(i,i)
+     sumdn = sumdn + dmat(i+nsites,i+nsites)
+  enddo
+
+   write(50,*) 'N_up: ', sumup, 'N_dn: ', sumdn, 'P: ', sumup - sumdn
+   write(*,*) 'N_up: ', sumup, 'N_dn: ', sumdn, 'P: ', sumup - sumdn
+
+end subroutine non_interacting
 
 !------------------------------------------------------------------!
 
@@ -339,8 +493,6 @@ subroutine get_dens_pol(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, U, mu
     call buildHext(nsites, Hdim, H, nk, Hzero, gap, mu, hz, Vext)
   endif
 
-
-
   open(2,file='nonzero_elements_ham.out',status='unknown')
   do i = 1, 4*nsites
      do j = 1, 4*nsites
@@ -373,21 +525,17 @@ subroutine get_dens_pol(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, U, mu
   close(2)
 
   ! get matrices U and V
-!
-!    H    (  V*  U  )  =   (  V*  U )  (  -E    0  )
-!         (  U*  V  )      (  U*  V )  (   0    E  )
-
+  !
+  !    H    (  V*  U  )  =   (  V*  U )  (  -E    0  )
+  !         (  U*  V  )      (  U*  V )  (   0    E  )
 
   Vbcs(1:2*nsites,1:2*nsites)=conjg(H(1:2*nsites         ,1:2*nsites))
   Ubcs(1:2*nsites,1:2*nsites)=conjg(H(1+2*nsites:4*nsites,1:2*nsites))
 
-
   ! get density matrix and pairing tensor
-
   dmat(:,:) = 0.d0
   pmat(:,:) = 0.d0
   pmatbar(:,:) = 0.d0
-
 
   ! dmat_{ij} =  (V* VT)_{i,j} = <c+_j c_i>
   call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1:2*nsites,1:2*nsites), &
@@ -400,7 +548,6 @@ subroutine get_dens_pol(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, U, mu
   !  pmatbar_{ij} = (U* VT)_{ij} = <cdagger_i cdagger_j>
   call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1+2*nsites:4*nsites,1:2*nsites), &
        2*nsites,H(1:2*nsites,1:2*nsites),2*nsites,zero,pmatbar,2*nsites)
-
 
 
   open(2,file='density_matrix.out',status='unknown')
