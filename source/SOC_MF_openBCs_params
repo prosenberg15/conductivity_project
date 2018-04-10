@@ -1,0 +1,29 @@
+40 40 1
+1
+0
+1
+1
+1.0
+0.0
+0.0
+0.0
+0.0
+0.9
+0.1
+1
+
+  open(10, file="SOC_MF_openBCs_params")
+  read(10,*) nk(1:3)
+  read(10,*) BCs: 0 for PBC 1 for open
+  read(10,*) getCN
+  read(10,*) Nthetax
+  read(10,*) Nthetay
+  read(10,*) lambda
+  read(10,*) thop
+  read(10,*) U
+  read(10,*) mu
+  read(10,*) hz
+  read(10,*) alpha
+  read(10,*) beta
+  read(10,*) IVext
+  close(10)
