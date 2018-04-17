@@ -84,6 +84,8 @@ program bcs_openBCs
     close(10)
   endif
 
+  allocate(phi(nmesh,4*nsites,2*nsites))
+
   tol   = 1.d-6
 
   write(Lxstr, '(i4)') nk(1)
@@ -115,7 +117,9 @@ program bcs_openBCs
 
  if(non_inter) then
     ! if system is non-interacting don't run full SCF procedure
-    call non_interacting()
+    write(*,*)  'running non-interacting procedure'
+    call non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu, hz, &
+     temp, Vext, openBCs)
  else
     call scf_loop(nk,nsites,iH0,Hzero,thop,msite,nmesh,phi,theta_twist, lambda,                   &
          &         U, mu, hz, temp, Vext, alpha, beta, tol, openBCs,calc_CN)
@@ -136,6 +140,7 @@ subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu
   integer, intent(in)            :: nk(3), nsites, iH0
   logical, intent(in)            :: openBCs
   real(kind=8), intent(in)       :: thop, lambda, mu, hz, temp, theta_twist(4)
+  real(kind=8)                   :: mu_up, mu_dn
   real(kind=8), intent(in)       :: Vext(nsites)
   complex(kind=8), intent(in)    :: Hzero(2*nsites,2*nsites)
 
@@ -144,13 +149,13 @@ subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu
   integer, parameter             :: lwork=50000
   complex(kind=8)                :: work(lwork)
 
-  integer                        :: Hdim, Udim, i, j, k, ix, iy, Dimen,idim, jdim
-  real(kind=8)                   :: energy_sum, f, ptcl_sum, pol_sum
-  complex(kind=8), allocatable   :: H(:,:)
+  integer                        :: Hdim, Hdim_ni, Udim, i, j, k, ix, iy,Dimen,idim,jdim
+  real(kind=8)                   :: energy_sum, f, ptcl_sum, pol_sum, rhat
+  complex(kind=8), allocatable   :: H(:,:), H_ni(:,:)
+  complex(kind=8), allocatable   :: phl(:,:),phr(:,:),ovp(:,:)
   complex(kind=8), allocatable   :: Ubcs(:,:),Vbcs(:,:)
-  complex(kind=8)                :: dmat(2*nsites,2*nsites),dmath(2*nsites,2*nsites)
-  complex(kind=8)                :: pmat(2*nsites,2*nsites),pmatbar(2*nsites,2*nsites)
-  complex(kind=8)                :: zero_vec(nsites)
+  complex(kind=8)                :: dmat(2*nsites,2*nsites)
+  complex(kind=8)                :: zero_vec(nsites), phase
   complex(kind=8)                :: Q(2*nsites,2*nsites), tmp(2*nsites,2*nsites)
   complex(kind=8), parameter     :: xi=dcmplx(0d0,1d0)
   real(kind=8), parameter        :: one=1.d0
@@ -159,8 +164,16 @@ subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu
   real(kind=8)                   :: hop(nsites,nsites), KE, MUE, MUEH
   real(kind=8)                   :: rvec(3,2*nsites),rav(3),metric(3,3)
 
-  complex(kind=8)                :: sum1, sum2
-  integer                        :: norb
+  complex(kind=8)                :: sum1, sum2, dummy
+  complex(kind=8),allocatable    :: ZetaN(:)
+  integer                        :: idir, isigma, ip
+  integer                        :: norb_up, norb_dn, nup, ndn
+  integer,allocatable            :: coords(:,:)
+  character                      :: dtype
+  
+  real(kind=8),parameter         :: pi=3.14159265358979323846264338
+
+  Dimen       = 2
 
   ptcl_sum    = 0.d0
   pol_sum     = 0.d0
@@ -170,13 +183,17 @@ subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu
   Hdim        = 4*nsites
   Udim        = 2*nsites
   energy_sum  = 0.d0
-  Hdim        = 4*nsites
-  Udim        = 2*nsites
+
+  if(dabs(lambda).gt.(1.d-6)) then
+	dtype = 'c'
+  else
+	dtype = 'd'
+  endif
 
   allocate(H(Hdim,Hdim))
   allocate(ener(Hdim))
-  allocate(Ubcs(Udim,Udim))
-  allocate(Vbcs(Udim,Udim))
+!  allocate(Ubcs(Udim,Udim))
+!  allocate(Vbcs(Udim,Udim))
 
   H(:,:)      = 0.d0
   ener(:)     = 0.d0
@@ -185,22 +202,30 @@ subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu
   ! build H
   if(iH0.eq.0)then
      if(openBCs) then
-        call buildHopen(nsites, Hdim, H, nk, thop, lambda, zero_vec, mu, hz, Vext)
+        call buildHopen(nsites, Hdim, H, nk, thop, lambda, zero_vec, 0.d0, 0.d0, Vext)
      else
-        call buildH(nsites, Hdim, H, nk, thop, theta_twist, lambda, zero_vec, mu, hz, Vext)
+        call buildH(nsites, Hdim, H, nk, thop, theta_twist, lambda, zero_vec, 0.d0, 0.d0, Vext)
      end if
   else
-     call buildHext(nsites, Hdim, H, nk, Hzero, zero_vec, mu, hz, Vext)
+     call buildHext(nsites, Hdim, H, nk, Hzero, zero_vec, 0.d0, 0.d0, Vext)
   endif
 
   ! check to make sure Hamiltonian is hermitian
   call check_Hermite_c(H,Hdim)
 
+  Hdim_ni = Hdim/2
+  allocate(H_ni(Hdim_ni,Hdim_ni))
+  do i = 1, 2*nsites, 1 
+	do j = 1, 2*nsites, 1
+		H_ni(i,j) = 2.d0*H(i,j) 
+	enddo
+  enddo
+  	
   ! diagonalize H
-  call zheev("V","L",Hdim,H,Hdim,ener,work,lwork,rwork,i)
+  call zheev("V","L",Hdim_ni,H_ni,Hdim_ni,ener,work,lwork,rwork,i)
 
-  open(2,file='eigenvalues_hfb_hamiltonian.out',status='unknown')
-  do i = 1, 4*nsites
+  open(2,file='eigenvalues_noninteracting_hamiltonian.out',status='unknown')
+  do i = 1, 2*nsites
      write(2,*)i,ener(i)
   enddo
   close(2)
@@ -210,25 +235,28 @@ subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu
   !    H    (  V*  U  )  =   (  V*  U )  (  -E    0  )
   !         (  U*  V  )      (  U*  V )  (   0    E  )
 
-  Vbcs(1:2*nsites,1:2*nsites)=conjg(H(1:2*nsites         ,1:2*nsites))
-  Ubcs(1:2*nsites,1:2*nsites)=conjg(H(1+2*nsites:4*nsites,1:2*nsites))
+  !Vbcs(1:2*nsites,1:2*nsites)=conjg(H(1:2*nsites         ,1:2*nsites))
+  !Ubcs(1:2*nsites,1:2*nsites)=conjg(H(1+2*nsites:4*nsites,1:2*nsites))
 
-  ! get density matrix and pairing tensor
+  ! get density matrix
   dmat(:,:) = 0.d0
-  pmat(:,:) = 0.d0
-  pmatbar(:,:) = 0.d0
+  !pmat(:,:) = 0.d0
+  !pmatbar(:,:) = 0.d0
+
+  call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H_ni, &
+       2*nsites,H_ni,2*nsites,zero,dmat,2*nsites)
 
   ! dmat_{ij} =  (V* VT)_{i,j} = <c+_j c_i>
-  call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1:2*nsites,1:2*nsites), &
-       2*nsites,H(1:2*nsites,1:2*nsites),2*nsites,zero,dmat,2*nsites)
+  !call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1:2*nsites,1:2*nsites), &
+  !     2*nsites,H(1:2*nsites,1:2*nsites),2*nsites,zero,dmat,2*nsites)
 
   !  pmat_{ij}    = (V* UT)_{ij} = <c_jc_i> 
-  call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1:2*nsites,1:2*nsites), &
-       2*nsites,H(1+2*nsites:4*nsites,1:2*nsites),2*nsites,zero,pmat,2*nsites)
+  !call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1:2*nsites,1:2*nsites), &
+  !     2*nsites,H(1+2*nsites:4*nsites,1:2*nsites),2*nsites,zero,pmat,2*nsites)
 
   !  pmatbar_{ij} = (U* VT)_{ij} = <cdagger_i cdagger_j>
-  call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1+2*nsites:4*nsites,1:2*nsites), &
-       2*nsites,H(1:2*nsites,1:2*nsites),2*nsites,zero,pmatbar,2*nsites)
+  !call zgemm('N','C',2*nsites,2*nsites,2*nsites,one,H(1+2*nsites:4*nsites,1:2*nsites), &
+  !     2*nsites,H(1:2*nsites,1:2*nsites),2*nsites,zero,pmatbar,2*nsites)
 
   open(2,file='density_matrix.out',status='unknown')
   do i = 1, 2*nsites
@@ -237,31 +265,91 @@ subroutine non_interacting(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, mu
     enddo
   enddo
   close(2)
-  open(2,file='pairing_matrix.out',status='unknown')
-  do i = 1, 2*nsites
-    do j = 1, 2*nsites
-      write(2,*)i,j,pmat(i,j)
-    enddo
-  enddo
-  write(2,*)
-  write(2,*)
-  do i = 1, 2*nsites
-    do j = 1, 2*nsites
-      write(2,*)i,j,pmatbar(i,j)
-    enddo
-  enddo
-  close(2)
-
-  sumup = 0.d0
-  sumdn = 0.d0
+  !open(2,file='pairing_matrix.out',status='unknown')
+  !do i = 1, 2*nsites
+  !  do j = 1, 2*nsites
+  !    write(2,*)i,j,pmat(i,j)
+  !  enddo
+  !enddo
+  !write(2,*)
+  !write(2,*)
+  !do i = 1, 2*nsites
+  !  do j = 1, 2*nsites
+  !    write(2,*)i,j,pmatbar(i,j)
+  !  enddo
+  !enddo
+  !close(2)
+  mu_up = mu + hz
+  mu_dn = mu - hz
+  
+  norb_up = 0 
+  norb_dn = 0                                                                                                                                               
   do i = 1, nsites
+	f = merge(1.0, 0.0, (ener(i)-mu_up) .lt. (1.d-8)) !1.0 / (exp(beta*(ener(i)-mu_up)) + 1.d0)                                                                                                                                                     
+	norb_up = norb_up + int(f)
+  end do
+  norb_up = norb_up/2	
+  do i = 1, nsites
+	f = merge(1.0, 0.0, (ener(i)-mu_dn) .lt. (1.d-8)) !1.0 / (exp(beta*(ener(i)-mu_dn)) + 1.d0)                                                                                                                                                     
+	norb_dn = norb_dn + int(f)
+  end do
+  norb_dn = norb_dn/2
+
+  do i = 1, norb_up
      sumup = sumup + dmat(i,i)
+  enddo
+  do i = 1, norb_dn
      sumdn = sumdn + dmat(i+nsites,i+nsites)
   enddo
 
-   write(50,*) 'N_up: ', sumup, 'N_dn: ', sumdn, 'P: ', sumup - sumdn
-   write(*,*) 'N_up: ', sumup, 'N_dn: ', sumdn, 'P: ', sumup - sumdn
+  write(50,*) 'N_up: ', sumup, 'N_dn: ', sumdn, 'P: ', sumup - sumdn
+  write(*,*) 'N_up: ', sumup, 'N_dn: ', sumdn, 'P: ', sumup - sumdn
 
+  if(dabs(dimag(sumup)).gt.(1.d-6)) write(*,*) 'error: nup is imaginary'
+  if(dabs(dimag(sumdn)).gt.(1.d-6)) write(*,*) 'error: ndn is imaginary'
+
+  nup = nint(dreal(sumup))
+  ndn = nint(dreal(sumdn))
+   
+  allocate(ovp(nup+ndn,nup+ndn))
+  allocate(phl(2*nsites,nup+ndn))
+  allocate(phr(2*nsites,nup+ndn))
+  allocate(coords(nsites,2))
+  allocate(ZetaN(Dimen))
+	
+  do i = 1, 2*nsites, 1
+	do j = 1, nup+ndn, 1
+		phl(i,j) = H_ni(i,j)
+		phr(i,j) = H_ni(i,j)
+    end do
+  end do
+
+  call sitenumber_to_xycoords(nk,nsites,Dimen,coords)
+  	
+  ! Calculate localization tensor (Resta-Sorella)
+  do idir = 1, Dimen, 1
+	phase = xi*2.d0*pi/nk(idir) 
+	k = 0
+	do isigma = 1, 2, 1
+	   do i = 1, Nsites, 1
+		k = k + 1
+		rhat = coords(i,idir)
+			do ip = 1, nup + ndn, 1
+				phr(k,ip) = phr(k,ip)*exp(phase*rhat)
+			enddo
+		enddo
+	enddo
+	
+  	call over_lap_dc(2*nsites,nup+ndn,nup,ndn,phl,phr,ovp,dtype)
+  	call caldet_dc(nup,ndn,nup+ndn,ovp,dummy,dtype)
+	!call over_lap_dc(ph_left(1,1),ph(1,1),ovp(1,1))
+	!call caldet_dc(ovp,dummy)
+
+	ZetaN(idir)=dummy
+	write(*,*) 'z_N: ', ZetaN(idir)
+
+  enddo
+  
 end subroutine non_interacting
 
 !------------------------------------------------------------------!
@@ -658,7 +746,7 @@ subroutine get_dens_pol(nk, nsites, iH0, Hzero, thop, theta_twist, lambda, U, mu
    close(2)
 
 
-   ! calcualte E0 from Green's functions
+   ! calculate E0 from Green's functions
    en_gs = 0.d0
    do i = 1, nsites
       do j = 1, nsites
@@ -799,9 +887,7 @@ enddo
 
 end subroutine buildHext
 
-
-
-
+	
 ! Build Hamiltonian matrix for system with open BCs
 subroutine buildHopen(nsites,Hdim,Hopen,nk,thop,lambda,gap,mu,hz,Vext)
 
@@ -1224,13 +1310,13 @@ end subroutine calc_ChernN
 subroutine deter_overlap(n,m,phi_l,phi_r,imp)
 use caldet_module
 implicit none
-integer,intent(IN)::n,m
-complex(kind=8),intent(IN):: phi_l(1,n,m),phi_r(1,n,m)
-complex(kind=8)           :: a(n,m), b(n,m)
-complex(kind=8),intent(INOUT)::imp
-complex(kind=8):: ovlpinv_temp(m,m)
-complex(kind=8)::one=dcmplx(1.d0,0.d0)
-complex(kind=8)::zero=dcmplx(0.d0,0.d0)
+integer,intent(IN)            :: n,m
+complex(kind=8),intent(IN)    :: phi_l(1,n,m),phi_r(1,n,m)
+complex(kind=8)               :: a(n,m), b(n,m)
+complex(kind=8),intent(INOUT) :: imp
+complex(kind=8)               :: ovlpinv_temp(m,m)
+complex(kind=8)               :: one = dcmplx(1.d0,0.d0)
+complex(kind=8)               :: zero = dcmplx(0.d0,0.d0)
 
 a(:,:) = phi_l(1,:,:)
 b(:,:) = phi_r(1,:,:)
@@ -1238,3 +1324,67 @@ b(:,:) = phi_r(1,:,:)
  call zgemm('C','N',m,m,n,one,a,n,b,n,zero,ovlpinv_temp,m)
  call caldet(m,ovlpinv_temp(1:m,1:m),imp)
 end subroutine deter_overlap
+
+!get the <pht|ph>=ovp                                                                                                                                                          
+subroutine over_lap_dc(n,m,nup,ndn,pht,ph,ovp,dtype)
+implicit none
+integer,intent(IN)          :: n,m,nup,ndn
+character,intent(IN)        :: dtype
+complex(kind=8),intent(IN)  :: pht(n,m)
+complex(kind=8),intent(IN)  :: ph(n,m)
+complex(kind=8),intent(OUT) :: ovp(m,m)
+complex(kind=8),parameter   :: zero = dcmplx(0.d0,0.d0)
+complex(kind=8),parameter   :: one  = dcmplx(1.d0,0.d0)
+
+if(dtype.EQ.'c') then
+  call deter_overlap(n,m,pht(1,1),ph(1,1),ovp(1,1))
+else if(dtype.EQ.'d') then
+  call zgemm('C','N',nup,nup,n/2,one,pht(1,1),n,ph(1,1),n,zero,ovp(1,1),m)
+  call zgemm('C','N',ndn,ndn,n/2,one,pht(n/2+1,nup+1),n,ph(n/2+1,nup+1), &
+           & n,zero,ovp((nup+1),(nup+1)),m)
+end if
+end subroutine over_lap_dc
+
+!calculate the determinant of a matrix                                                                                                                                         
+subroutine caldet_dc(nup,ndn,Ntot,ovp,imp,dtype)
+use caldet_module
+implicit none
+integer,intent(IN)          :: nup, ndn, Ntot
+character,intent(IN)        :: dtype
+complex(kind=8),intent(IN)  :: ovp(Ntot,Ntot)
+complex(kind=8),intent(OUT) :: imp
+complex(kind=8)             :: imp1,imp2
+if(dtype.EQ.'c') then
+  call caldet(Ntot,ovp(1:Ntot,1:Ntot),imp)
+else if(dtype.EQ.'d') then
+  call caldet(nup,ovp(1:nup,1:nup),imp1)
+  call caldet(ndn,ovp((nup+1):Ntot,(nup+1):Ntot),imp2)
+  imp=imp1*imp2
+end if
+end subroutine caldet_dc
+
+subroutine sitenumber_to_xycoords(nk,nsites,Dimen,coords)
+implicit none
+integer, intent(IN)    :: nk(3), nsites, Dimen
+integer, intent(INOUT) :: coords(nsites,2)
+integer                :: i,j,k
+integer                :: ntemp,den
+!convert lattice-site number i to                                                                                                                                              
+!x-coordinate, coords(i,1)                                                                                                                                                     
+!y-coordinate, coords(i,2)
+
+do i=1,nsites,1
+    ntemp=i-1
+    do j=Dimen,1,-1
+       den=1
+       do k=1,j-1,1
+          den=den*nk(k)
+       end do !den is z coords Nl(1)*Nl(2)                                                                                                                                     
+              !       y coords Nl(1)                                                                                                                                           
+              !       x coords 1                                                                                                                                               
+       coords(i,j)=ntemp/den
+       ntemp=ntemp-coords(i,j)*den
+       coords(i,j)=coords(i,j)+1
+    end do
+ end do
+end subroutine sitenumber_to_xycoords
